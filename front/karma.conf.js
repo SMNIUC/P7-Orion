@@ -27,7 +27,13 @@ module.exports = function (config) {
     coverageReporter: {
       dir: require("path").join(__dirname, "./coverage/microcrm"),
       subdir: ".",
-      reporters: [{ type: "html" }, { type: "text-summary" }],
+      // "lcovonly" produit coverage/microcrm/lcov.info, consomme par SonarQube Cloud
+      // (sonar.javascript.lcov.reportPaths). "html"/"text-summary" restent pour l'humain.
+      reporters: [
+        { type: "html" },
+        { type: "text-summary" },
+        { type: "lcovonly" },
+      ],
     },
     reporters: ["progress", "kjhtml"],
     browsers: ["ChromeHeadlessNoSandbox", "ChromeHeadless", "Chrome"],
