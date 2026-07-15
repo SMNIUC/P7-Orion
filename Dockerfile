@@ -54,30 +54,33 @@ FROM caddy:2-alpine AS front
 COPY --from=front-build /src/dist/microcrm/browser /app/front
 COPY misc/docker/Caddyfile /etc/caddy/Caddyfile
 
-EXPOSE 80 443
+EXPOSE 80
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD wget --quiet --spider http://localhost/ || exit 1
+    CMD wget -q -O /dev/null http://localhost/ || exit 1
 
 # The official Caddy image already runs: caddy run --config /etc/caddy/Caddyfile
 
 # -----------------------------------------------------------------------------
-# Backend runtime stage (Spring Boot on a minimal JRE, non-root)
+# Backend runtime stage (Spring Boot on a minimal Alpine JRE, non-root)
+#   Image Alpine officielle Adoptium : ~286 Mo (vs ~479 Mo pour la variante Ubuntu),
+#   busybox wget inclus (utilise par le HEALTHCHECK), pas d'outils superflus.
 # -----------------------------------------------------------------------------
-FROM eclipse-temurin:21-jre AS back
+FROM eclipse-temurin:21-jre-alpine AS back
 
 WORKDIR /app
 
-# Run as an unprivileged user.
-RUN groupadd --system spring && useradd --system --gid spring spring
+# Utilisateur non privilegie (moindre privilege). Syntaxe Alpine (busybox).
+RUN addgroup -S spring && adduser -S -G spring spring
 USER spring:spring
 
 COPY --from=back-build /app.jar /app/microcrm.jar
 
 EXPOSE 8080
 
+# GET sur la racine Spring Data REST (renvoie 200). Forme portable busybox wget.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
-    CMD wget --quiet --spider http://localhost:8080/ || exit 1
+    CMD wget -q -O /dev/null http://localhost:8080/ || exit 1
 
 ENTRYPOINT ["java", "-jar", "/app/microcrm.jar"]
 
@@ -95,6 +98,6 @@ COPY --from=back-build /app.jar /app/back/microcrm.jar
 COPY misc/docker/Caddyfile /etc/caddy/Caddyfile
 COPY misc/docker/supervisor.ini /app/supervisor.ini
 
-EXPOSE 80 443 8080
+EXPOSE 80 8080
 
 CMD ["supervisord", "-c", "/app/supervisor.ini"]

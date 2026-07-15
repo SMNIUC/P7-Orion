@@ -1,0 +1,31 @@
+version: 2
+updates:
+  # Backend - dependances Gradle (Spring Boot, etc.)
+  - package-ecosystem: gradle
+    directory: /back
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels: [dependencies, backend]
+
+  # Frontend - dependances npm (Angular, etc.)
+  - package-ecosystem: npm
+    directory: /front
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels: [dependencies, frontend]
+
+  # Images de base Docker
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    labels: [dependencies, docker]
+
+  # Actions GitHub utilisees par le pipeline CI/CD
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    labels: [dependencies, ci]
