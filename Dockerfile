@@ -1,57 +1,100 @@
-FROM node as front-build
+# syntax=docker/dockerfile:1
 
-COPY ./front /src
+# =============================================================================
+# MicroCRM - Multi-stage Dockerfile
+#
+# Targets:
+#   - front       : static Angular app served by Caddy
+#   - back        : Spring Boot API on a minimal JRE
+#   - standalone   : front + back in a single image (supervisor)
+#
+# Base images are pinned to explicit tags for reproducible builds.
+# BuildKit cache mounts are used to speed up npm / Gradle dependency resolution.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Frontend build stage
+# -----------------------------------------------------------------------------
+FROM node:22-alpine AS front-build
 
 WORKDIR /src
 
-RUN npm ci \
-    && npx @angular/cli build --optimization
+# Copy manifests first so the (slow) dependency install layer is cached
+# and only re-run when package.json / package-lock.json change.
+COPY front/package.json front/package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm npm ci
 
-FROM gradle:jdk17 as back-build
+# Copy the rest of the sources and build the production bundle.
+COPY front/ ./
+RUN npm run build
 
-COPY ./back /src
+# -----------------------------------------------------------------------------
+# Backend build stage
+# -----------------------------------------------------------------------------
+FROM eclipse-temurin:21-jdk AS back-build
 
 WORKDIR /src
 
-RUN ./gradlew build
+# Copy the Gradle wrapper and build scripts first to cache dependency resolution.
+COPY back/gradlew ./
+COPY back/gradle ./gradle
+COPY back/build.gradle back/settings.gradle ./
+RUN chmod +x gradlew
 
-FROM alpine:3.19 as front
+# Copy sources and build the executable (Spring Boot) jar.
+COPY back/src ./src
+RUN --mount=type=cache,target=/root/.gradle ./gradlew --no-daemon clean bootJar \
+    && cp build/libs/*.jar /app.jar
+
+# -----------------------------------------------------------------------------
+# Frontend runtime stage (static files served by Caddy)
+# -----------------------------------------------------------------------------
+FROM caddy:2-alpine AS front
 
 COPY --from=front-build /src/dist/microcrm/browser /app/front
-COPY misc/docker/Caddyfile /app/Caddyfile
+COPY misc/docker/Caddyfile /etc/caddy/Caddyfile
 
-RUN apk add caddy
+EXPOSE 80 443
 
-WORKDIR /app
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD wget --quiet --spider http://localhost/ || exit 1
 
-EXPOSE 80
-EXPOSE 443
+# The official Caddy image already runs: caddy run --config /etc/caddy/Caddyfile
 
-CMD ["/usr/sbin/caddy", "run"]
-
-FROM alpine:3.19 as back
-
-COPY --from=back-build /src/build/libs/microcrm-0.0.1-SNAPSHOT.jar /app/back/microcrm-0.0.1-SNAPSHOT.jar
-
-RUN apk add openjdk21-jre-headless
+# -----------------------------------------------------------------------------
+# Backend runtime stage (Spring Boot on a minimal JRE, non-root)
+# -----------------------------------------------------------------------------
+FROM eclipse-temurin:21-jre AS back
 
 WORKDIR /app
 
-EXPOSE 4200
+# Run as an unprivileged user.
+RUN groupadd --system spring && useradd --system --gid spring spring
+USER spring:spring
 
-CMD ["java", "-jar", "/app/back/microcrm-0.0.1-SNAPSHOT.jar"]
+COPY --from=back-build /app.jar /app/microcrm.jar
 
-FROM alpine:3.19 as standalone
+EXPOSE 8080
 
-COPY --from=front / /
-COPY --from=back / /
+HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
+    CMD wget --quiet --spider http://localhost:8080/ || exit 1
+
+ENTRYPOINT ["java", "-jar", "/app/microcrm.jar"]
+
+# -----------------------------------------------------------------------------
+# Standalone stage (front + back in one image, orchestrated by supervisor)
+# -----------------------------------------------------------------------------
+FROM eclipse-temurin:21-jre-alpine AS standalone
+
+RUN apk add --no-cache caddy supervisor
+
+WORKDIR /app
+
+COPY --from=front-build /src/dist/microcrm/browser /app/front
+COPY --from=back-build /app.jar /app/back/microcrm.jar
+COPY misc/docker/Caddyfile /etc/caddy/Caddyfile
 COPY misc/docker/supervisor.ini /app/supervisor.ini
 
-RUN apk add supervisor
+EXPOSE 80 443 8080
 
-WORKDIR /app
-
-CMD ["/usr/bin/supervisord", "-c", "/app/supervisor.ini"]
-
-
-
+CMD ["supervisord", "-c", "/app/supervisor.ini"]

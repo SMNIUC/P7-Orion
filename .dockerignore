@@ -1,5 +1,28 @@
-/back/.gradle
-/back/build
-/front/dist
-/front/node_modules
-/front/.angular
+# Version control & IDE
+.git
+.gitignore
+.github
+.idea
+.vscode
+**/.idea
+**/.vscode
+
+# Backend build artifacts
+back/.gradle
+back/build
+back/bin
+
+# Frontend build artifacts
+front/dist
+front/node_modules
+front/.angular
+front/coverage
+
+# Docs & misc not needed inside images (misc/docker IS needed, keep it)
+README.md
+**/*.md
+misc/screenshots
+
+# OS files
+.DS_Store
+**/.DS_Store
