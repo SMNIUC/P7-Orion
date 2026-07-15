@@ -10,6 +10,10 @@
     "test:ci": "ng test --watch=false --browsers=ChromeHeadlessNoSandbox --code-coverage"
   },
   "private": true,
+  "engines": {
+    "node": "22.x",
+    "npm": "10.x"
+  },
   "dependencies": {
     "@angular/animations": "^20.3.26",
     "@angular/common": "^20.3.26",
