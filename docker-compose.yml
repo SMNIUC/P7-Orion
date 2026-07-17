@@ -1,0 +1,60 @@
+# =============================================================================
+# Orion MicroCRM - Orchestration locale front + back
+#
+#   docker compose up --build      # construit puis demarre les deux services
+#   http://localhost:4200          # frontend (Angular servi par Caddy)
+#   http://localhost:8080          # backend  (API Spring Data REST)
+#
+# Les services sont construits a partir des MEMES cibles du Dockerfile que celles
+# publiees par la CI sur GHCR (targets "front" et "back") -> parite CI / local.
+#
+# /!\ Contrainte de port : le frontend appelle l'API en absolu via
+#     front/src/app/config.ts -> API_BASE_URL = "http://localhost:8080".
+#     L'appel part du NAVIGATEUR (hote), donc le back DOIT etre publie sur 8080.
+#     Le back autorise le CORS (SpringDataRestCustomization -> allowedOrigins("*")).
+#
+# Aucune donnee sensible ici : la base est HSQLDB en memoire (fixtures au demarrage),
+# aucun secret / identifiant n'est requis.
+# =============================================================================
+
+services:
+  back:
+    build:
+      context: .
+      target: back
+    image: orion-microcrm-back:local
+    container_name: microcrm-back
+    ports:
+      - "8080:8080"          # doit rester 8080 (cf. API_BASE_URL du front)
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8080/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
+    networks: [microcrm]
+
+  front:
+    build:
+      context: .
+      target: front
+    image: orion-microcrm-front:local
+    container_name: microcrm-front
+    ports:
+      - "4200:80"            # http://localhost:4200 -> Caddy (port 80 du conteneur)
+    depends_on:
+      back:
+        condition: service_healthy   # le front n'est lance qu'une fois le back "healthy"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    networks: [microcrm]
+
+networks:
+  microcrm:
+    driver: bridge

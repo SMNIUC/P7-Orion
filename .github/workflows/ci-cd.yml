@@ -1,0 +1,200 @@
+name: CI/CD
+
+# -----------------------------------------------------------------------------
+# Pipeline CI/CD pour l'application Full-Stack MicroCRM (Java / Angular).
+#
+# Etapes :
+#   1. backend-ci   : build + tests + couverture JaCoCo du backend (Java 21 / Gradle)
+#   2. frontend-ci  : tests + couverture LCOV + build du frontend Angular (Node 22)
+#   3. sonar        : analyse qualite & securite SonarQube Cloud (push + PR),
+#                     Quality Gate bloquant, apres les tests / avant la publication
+#   4. docker       : build & push des images vers GHCR (seulement sur main / tags),
+#                     conditionne a la reussite des tests ET de l'analyse Sonar
+# -----------------------------------------------------------------------------
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+# Annule les executions obsoletes sur une meme ref (economie de minutes CI).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Principe du moindre privilege : lecture seule par defaut.
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Backend : Spring Boot / Java 21 / Gradle
+  # ---------------------------------------------------------------------------
+  backend-ci:
+    name: Backend - build & tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: back
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Gradle (avec cache)
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build, test & couverture JaCoCo
+        run: ./gradlew --no-daemon build jacocoTestReport
+
+      # Classes compilees + rapport JaCoCo : consommes par le job "sonar".
+      # Rapports de tests : lisibles/telechargeables par un humain.
+      - name: Publier les artefacts backend (classes, jar, rapports)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-build
+          path: |
+            back/build/classes
+            back/build/libs
+            back/build/reports
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # Frontend : Angular 20 / Node 22
+  # ---------------------------------------------------------------------------
+  frontend-ci:
+    name: Frontend - build & tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: front
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 22 (avec cache npm)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: front/package-lock.json
+
+      - name: Installer les dependances (reproductible)
+        run: npm ci
+
+      - name: Tests unitaires (Chrome headless + couverture)
+        run: npm run test:ci
+
+      - name: Build de production
+        run: npm run build
+
+      - name: Publier la couverture de code
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-coverage
+          path: front/coverage
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # SonarQube Cloud : analyse qualite & securite (SAST) du monorepo.
+  # S'execute sur push ET pull request (decoration de la PR), APRES les tests
+  # (consomme couverture + classes compilees) et AVANT la publication d'images.
+  # Le Quality Gate est bloquant (sonar.qualitygate.wait=true).
+  # Pre-requis : secret SONAR_TOKEN + projet configure (voir sonar-project.properties).
+  # ---------------------------------------------------------------------------
+  sonar:
+    name: SonarQube Cloud - qualite & securite
+    runs-on: ubuntu-latest
+    needs: [backend-ci, frontend-ci]
+    steps:
+      - name: Checkout (historique complet pour l'analyse SCM/new-code)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Recuperer les classes compilees + rapport JaCoCo (backend)
+        uses: actions/download-artifact@v4
+        with:
+          name: backend-build
+          path: back/build
+
+      - name: Recuperer la couverture LCOV (frontend)
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-coverage
+          path: front/coverage
+
+      - name: Analyse SonarQube Cloud (Quality Gate bloquant)
+        uses: SonarSource/sonarqube-scan-action@v5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: https://sonarcloud.io
+        with:
+          args: >
+            -Dsonar.qualitygate.wait=true
+
+  # ---------------------------------------------------------------------------
+  # Docker : build & push vers GHCR.
+  # Quality gate complet : ne publie que si tests ET analyse Sonar passent.
+  # Ne s'execute pas sur les Pull Requests (uniquement push main / tags).
+  # ---------------------------------------------------------------------------
+  docker:
+    name: Docker - build & push (GHCR)
+    runs-on: ubuntu-latest
+    needs: [backend-ci, frontend-ci, sonar]
+    if: github.event_name == 'push'
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        target: [front, back, standalone]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Normaliser le proprietaire en minuscules (contrainte GHCR)
+        id: repo
+        run: echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Metadonnees (tags & labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ steps.repo.outputs.owner }}/microcrm-${{ matrix.target }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=short
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build & push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: ${{ matrix.target }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

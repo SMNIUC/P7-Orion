@@ -1,5 +1,6 @@
 plugins {
 	id 'java'
+	id 'jacoco'
 	id 'org.springframework.boot' version '3.5.16'
 	id 'io.spring.dependency-management' version '1.1.7'
 	id 'com.adarshr.test-logger' version '4.0.0'
@@ -29,4 +30,15 @@ dependencies {
 
 test {
     useJUnitPlatform()
+    finalizedBy jacocoTestReport
+}
+
+// Rapport de couverture au format XML, consomme par SonarQube Cloud
+// (sonar.coverage.jacoco.xmlReportPaths). Genere automatiquement apres les tests.
+jacocoTestReport {
+    dependsOn test
+    reports {
+        xml.required = true
+        html.required = true
+    }
 }
