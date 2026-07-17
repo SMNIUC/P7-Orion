@@ -1,0 +1,155 @@
+# =============================================================================
+# Orion MicroCRM - Stack ELK locale (monitoring / Partie 2)
+#
+# Surcouche du docker-compose.yml applicatif : elle AJOUTE Elasticsearch,
+# Logstash et Kibana, et branche les logs de "back" et "front" dessus via un
+# volume partage. Le fichier applicatif reste inchange (c'est le livrable
+# CI/CD) -> on peut toujours lancer l'app seule, sans ELK.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.elk.yml up -d --build
+#   http://localhost:5601   # Kibana
+#   http://localhost:9200   # Elasticsearch
+#
+# /!\ NE FAIT PAS PARTIE DU PIPELINE CI/CD : trop lourd et sans valeur en CI.
+#     C'est un outil d'observation LOCAL, jamais reference par ci-cd.yml.
+#
+# Chaine de collecte (voir misc/elk/logstash/pipeline/microcrm.conf) :
+#   back  --(JSON ECS natif)--> /var/log/microcrm/back.json  --\
+#                                                               >-- Logstash --> ES --> Kibana
+#   front --(JSON access log)-> /var/log/microcrm/front.json --/
+#
+# Le choix du FICHIER partage (plutot que du driver de log "gelf" ou d'un
+# Filebeat supplementaire) est deliberé :
+#   - aucun composant en plus (la consigne dit "stack ELK", pas ELK+Beats) ;
+#   - "docker logs" continue de fonctionner normalement ;
+#   - pas de troncature UDP : les stack traces Java arrivent entieres.
+#
+# --- MEMOIRE (point de vigilance) --------------------------------------------
+# Chaque conteneur est plafonne (mem_limit) et chaque JVM a un heap fixe.
+# Plafonds cumules : ~3,3 Go (ES 1536 + Logstash 640 + Kibana 768 + back 384
+# + front 64), dimensionnes pour tenir dans une Docker Desktop a 4 Go.
+#
+# Consommation REELLE mesuree sur ce projet (docker stats, en charge legere) :
+#   elasticsearch ~1,0 Go | kibana ~610 Mo | logstash ~515 Mo | back ~230 Mo
+#
+# Le heap Elasticsearch est volontairement bas (512 Mo) : suffisant pour un
+# volume de demonstration, a relever pour un usage reel. Si Docker dispose de
+# plus de 4 Go, augmenter en priorite ES_JAVA_OPTS puis mem_limit d'ES.
+# =============================================================================
+
+services:
+  # --- Application : branchement des logs sur le volume partage --------------
+  back:
+    environment:
+      # Active back/src/main/resources/application-elk.properties :
+      #   - logs applicatifs en JSON ECS natif (Spring Boot 3.4+, 0 dependance) ;
+      #   - access log Tomcat en JSON (statut HTTP + duree des requetes).
+      # Uniquement ici -> "docker compose up" seul garde des logs console
+      # lisibles par un humain et n'ecrit aucun fichier.
+      SPRING_PROFILES_ACTIVE: elk
+    volumes:
+      - microcrm-logs:/var/log/microcrm
+    # Mesure : ~230 Mio en usage nominal -> 384 Mio laisse de la marge tout en
+    # rendant de la memoire a Elasticsearch (budget total contraint, cf. entete).
+    mem_limit: 384m
+
+  front:
+    volumes:
+      - microcrm-logs:/var/log/microcrm
+    mem_limit: 64m
+
+  # --- Elasticsearch : stockage & indexation --------------------------------
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.19.13
+    container_name: microcrm-elasticsearch
+    environment:
+      # Noeud unique : pas de decouverte de cluster (contexte local).
+      discovery.type: single-node
+      # Securite desactivee : stack LOCALE, non exposee, sur des logs sans
+      # donnee personnelle (HSQLDB en memoire). Evite certificats et mots de
+      # passe pour un outil de poste. A REACTIVER pour tout usage partage/distant.
+      xpack.security.enabled: "false"
+      # Modules inutiles ici, desactives pour economiser la memoire...
+      xpack.ml.enabled: "false"
+      # ...et pour eviter tout appel reseau sortant au demarrage.
+      ingest.geoip.downloader.enabled: "false"
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+    ulimits:
+      memlock: { soft: -1, hard: -1 }
+      nofile: { soft: 65536, hard: 65536 }
+    # /!\ 1,5 Go pour 512 Mo de heap : ce n'est PAS du gaspillage. Elasticsearch
+    # consomme beaucoup de HORS-TAS (Lucene, mmap, buffers), non compte dans
+    # -Xmx. Mesure sur ce projet : a mem_limit 1g, le conteneur plafonnait a
+    # 1002 Mio soit 98 % -> risque d'arret par l'OOM killer sous charge.
+    mem_limit: 1536m
+    ports:
+      - "9200:9200"
+    volumes:
+      - elasticsearch-data:/usr/share/elasticsearch/data
+    healthcheck:
+      # "yellow" est l'etat NORMAL d'un noeud unique : les replicas ne peuvent
+      # pas etre alloues ailleurs. Exiger "green" bloquerait le demarrage.
+      test: ["CMD-SHELL", "curl -fsS 'http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=5s' || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    restart: unless-stopped
+    networks: [microcrm]
+
+  # --- Logstash : collecte & normalisation ----------------------------------
+  logstash:
+    image: docker.elastic.co/logstash/logstash:8.19.13
+    container_name: microcrm-logstash
+    environment:
+      LS_JAVA_OPTS: "-Xms256m -Xmx256m"
+      # Monitoring interne inutile en local (economie de memoire).
+      XPACK_MONITORING_ENABLED: "false"
+    mem_limit: 640m
+    volumes:
+      - ./misc/elk/logstash/pipeline:/usr/share/logstash/pipeline:ro
+      # Les logs applicatifs, en LECTURE SEULE : Logstash observe, n'ecrit pas.
+      - microcrm-logs:/var/log/microcrm:ro
+      # Persiste les "sincedb" (offsets de lecture) -> pas de re-indexation
+      # complete, donc pas de doublons, apres un redemarrage de Logstash.
+      - logstash-data:/usr/share/logstash/data
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9600 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 90s
+    restart: unless-stopped
+    networks: [microcrm]
+
+  # --- Kibana : exploration & tableaux de bord ------------------------------
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.19.13
+    container_name: microcrm-kibana
+    environment:
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+      SERVER_PUBLICBASEURL: http://localhost:5601
+      NODE_OPTIONS: "--max-old-space-size=512"
+    mem_limit: 768m
+    ports:
+      - "5601:5601"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:5601/api/status || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 90s
+    restart: unless-stopped
+    networks: [microcrm]
+
+volumes:
+  # Volume d'echange : ecrit par back + front, lu par Logstash.
+  microcrm-logs:
+  elasticsearch-data:
+  logstash-data:

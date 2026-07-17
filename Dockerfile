@@ -72,6 +72,14 @@ WORKDIR /app
 
 # Utilisateur non privilegie (moindre privilege). Syntaxe Alpine (busybox).
 RUN addgroup -S spring && adduser -S -G spring spring
+
+# Repertoire des logs applicatifs, cree AVANT le "USER" et donne a "spring" :
+# un volume monte ici herite de ces droits, sinon Docker le creerait root:root
+# et l'application non-root ne pourrait pas y ecrire.
+# Utilise uniquement par la stack ELK (docker-compose.elk.yml) ; sans volume
+# monte, ce repertoire reste vide et sans effet.
+RUN mkdir -p /var/log/microcrm && chown spring:spring /var/log/microcrm
+
 USER spring:spring
 
 COPY --from=back-build /app.jar /app/microcrm.jar

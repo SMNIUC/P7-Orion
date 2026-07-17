@@ -2,6 +2,25 @@
 # automatique de Caddy : pas de redirection 80->443 ni de certificat auto-signe.
 # La terminaison TLS est deleguee a un reverse-proxy / ingress en amont.
 :80 {
+	# Journal d'acces au format JSON, ecrit dans un fichier lu par Logstash
+	# (cf. docker-compose.elk.yml + misc/elk/logstash/pipeline/microcrm.conf).
+	# C'est la source des metriques front : codes HTTP (erreurs) et "duration"
+	# (performance). Caddy assure lui-meme la rotation (10 Mio x 3 fichiers),
+	# le volume ne peut donc pas croitre indefiniment.
+	# Sans la stack ELK, ce fichier reste dans le conteneur, sans effet.
+	log {
+		output file /var/log/microcrm/front.json {
+			roll_size 10MiB
+			roll_keep 3
+			# Caddy ecrit ses fichiers de log en 0600 par defaut : le conteneur
+			# Logstash (utilisateur "logstash", uid 1000) ne pourrait alors PAS
+			# lire ce fichier ecrit par root -> aucun log front dans Kibana.
+			# 0644 = lecture pour Logstash, ecriture reservee a Caddy.
+			mode 0644
+		}
+		format json
+	}
+
 	root * /app/front
 	encode gzip
 	try_files {path} /index.html
