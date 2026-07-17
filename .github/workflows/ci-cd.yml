@@ -10,6 +10,14 @@ name: CI/CD
 #                     Quality Gate bloquant, apres les tests / avant la publication
 #   4. docker       : build & push des images vers GHCR (seulement sur main / tags),
 #                     conditionne a la reussite des tests ET de l'analyse Sonar
+#   5. deploy  (CD) : demarre les images PUBLIEES, verifie qu'elles repondent
+#                     (smoke tests), puis promeut le tag "latest" -> livraison
+#                     tracee dans l'environnement GitHub "release"
+#
+# Modele de livraison : "publier -> verifier -> promouvoir".
+#   - Chaque build publie un tag IMMUABLE "sha-<court>" (+ tags semver sur "v*").
+#   - Le tag MOBILE "latest" n'est deplace qu'apres les smoke tests : il designe
+#     donc toujours une release dont on a verifie qu'elle demarre reellement.
 # -----------------------------------------------------------------------------
 
 on:
@@ -146,6 +154,9 @@ jobs:
   # Docker : build & push vers GHCR.
   # Quality gate complet : ne publie que si tests ET analyse Sonar passent.
   # Ne s'execute pas sur les Pull Requests (uniquement push main / tags).
+  #
+  # Ne pose QUE des tags immuables (sha-<court>, semver sur "v*") : le tag mobile
+  # "latest" est pose par le job "deploy", apres verification (cf. en-tete).
   # ---------------------------------------------------------------------------
   docker:
     name: Docker - build & push (GHCR)
@@ -186,7 +197,6 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=sha,format=short
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
 
       - name: Build & push
         uses: docker/build-push-action@v6
@@ -198,3 +208,166 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # ---------------------------------------------------------------------------
+  # CD : livraison de la release.
+  #
+  # Le "deploiement" de ce projet est la publication d'un artefact conteneurise
+  # VERIFIE dans le registre GHCR, qui est la cible de livraison (cf. README).
+  # Le job ne reconstruit rien : il execute les images telles qu'elles viennent
+  # d'etre publiees, ce qui teste l'artefact reellement livre.
+  #
+  #   1. demarre les images publiees via docker-compose.deploy.yml (--wait :
+  #      attend que les HEALTHCHECK des conteneurs passent "healthy") ;
+  #   2. smoke tests : le front sert bien l'application, l'API repond et
+  #      renvoie les donnees attendues ;
+  #   3. verifie aussi l'image "standalone" (front + back en un conteneur),
+  #      absente de la compose, sur des ports dedies ;
+  #   4. ne promeut "latest" qu'une fois tout cela vert, et seulement sur main.
+  #
+  # Tracabilite : l'environnement GitHub "release" enregistre chaque livraison
+  # (date, commit, auteur) -> source des metriques DORA (frequence de
+  # deploiement, lead time) exploitees en Partie 2.
+  #
+  # Aucun secret propre : GITHUB_TOKEN est fourni par GitHub, limite a ce depot
+  # et expire a la fin du job.
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: CD - verification & promotion de la release
+    runs-on: ubuntu-latest
+    needs: [docker]
+    if: github.event_name == 'push'
+    environment:
+      name: release
+      url: https://github.com/${{ github.repository }}/pkgs/container/microcrm-front
+    permissions:
+      contents: read
+      packages: write        # lecture des images + promotion du tag "latest"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resoudre la reference de la release a verifier
+        # Doit reproduire a l'identique le tag pose par metadata-action
+        # (type=sha,format=short = les 7 premiers caracteres du SHA).
+        run: |
+          echo "GHCR_OWNER=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_ENV"
+          echo "IMAGE_TAG=sha-${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+
+      - name: Login GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Recuperer les images publiees
+        run: docker compose -f docker-compose.yml -f docker-compose.deploy.yml pull
+
+      - name: Demarrer la release (attente des healthchecks)
+        run: |
+          docker compose -f docker-compose.yml -f docker-compose.deploy.yml \
+            up -d --no-build --wait --wait-timeout 180
+
+      - name: Smoke tests - front + API
+        run: |
+          set -euo pipefail
+
+          # On telecharge dans un fichier avant de verifier le contenu : un
+          # "curl | grep -q" romprait le tube des la 1re correspondance (SIGPIPE
+          # -> echec de curl -> pipefail), rendant le test faussement rouge.
+
+          echo "::group::Front - l'application est servie"
+          curl -fsS --retry 5 --retry-delay 3 -o front.html http://localhost:4200/
+          grep -q '<app-root' front.html
+          echo "OK : index.html contient <app-root>"
+          echo "::endgroup::"
+
+          echo "::group::API - racine Spring Data REST"
+          curl -fsS -o /dev/null http://localhost:8080/
+          echo "OK : l'API repond sur :8080"
+          echo "::endgroup::"
+
+          echo "::group::API - les donnees attendues sont presentes"
+          # Verifie un comportement metier, pas seulement un code 200 :
+          # l'organisation chargee par InitialDataFixture doit etre exposee.
+          curl -fsS -o organizations.json http://localhost:8080/organizations
+          grep -q 'Orion Incorporated' organizations.json
+          echo "OK : /organizations expose \"Orion Incorporated\""
+          echo "::endgroup::"
+
+      - name: Smoke test - image standalone
+        run: |
+          set -euo pipefail
+
+          # Ports dedies : la compose occupe deja 4200 et 8080.
+          docker run -d --name microcrm-standalone-check \
+            -p 4201:80 -p 8081:8080 \
+            "ghcr.io/${GHCR_OWNER}/microcrm-standalone:${IMAGE_TAG}"
+
+          # Pas de HEALTHCHECK sur cette cible (supervisor) : on attend nous-memes.
+          for i in $(seq 1 30); do
+            # stderr etouffe : les refus de connexion sont attendus tant que
+            # l'API demarre, seul l'epuisement des tentatives est une erreur.
+            if curl -fsS -o /dev/null http://localhost:8081/ 2>/dev/null ; then
+              echo "API standalone prete (tentative $i)"
+              break
+            fi
+            if [ "$i" -eq 30 ]; then
+              echo "::error::l'image standalone n'a pas demarre en 150 s"
+              docker logs microcrm-standalone-check || true
+              exit 1
+            fi
+            sleep 5
+          done
+
+          curl -fsS -o standalone-front.html http://localhost:4201/
+          grep -q '<app-root' standalone-front.html
+
+          curl -fsS -o standalone-organizations.json http://localhost:8081/organizations
+          grep -q 'Orion Incorporated' standalone-organizations.json
+
+          echo "OK : l'image standalone sert le front et l'API"
+
+      - name: Journaux des conteneurs (si echec)
+        if: failure()
+        run: |
+          docker compose -f docker-compose.yml -f docker-compose.deploy.yml \
+            logs --no-color --tail 200 || true
+          docker logs microcrm-standalone-check || true
+
+      - name: Promouvoir la release en "latest"
+        # Uniquement sur main : "latest" = derniere version de la branche par
+        # defaut, verifiee. Re-etiquetage cote registre (imagetools), sans
+        # reconstruire ni re-pousser les couches : le binaire promu est
+        # bit-pour-bit celui qui vient d'etre teste.
+        if: github.ref == 'refs/heads/main'
+        run: |
+          set -euo pipefail
+          for target in front back standalone; do
+            image="ghcr.io/${GHCR_OWNER}/microcrm-${target}"
+            docker buildx imagetools create -t "${image}:latest" "${image}:${IMAGE_TAG}"
+            echo "Promu : ${image}:${IMAGE_TAG} -> ${image}:latest"
+          done
+
+      - name: Arreter les conteneurs de verification
+        if: always()
+        run: |
+          docker compose -f docker-compose.yml -f docker-compose.deploy.yml \
+            down -v || true
+          docker rm -f microcrm-standalone-check || true
+
+      - name: Recapitulatif de la release
+        if: success()
+        run: |
+          {
+            echo "### Release livree :rocket:"
+            echo ""
+            echo "| Element | Valeur |"
+            echo "|---|---|"
+            echo "| Commit | \`${GITHUB_SHA::7}\` |"
+            echo "| Tag immuable | \`${IMAGE_TAG}\` |"
+            echo "| Promu \`latest\` | ${{ github.ref == 'refs/heads/main' && 'oui' || 'non (hors main)' }} |"
+            echo ""
+            echo "Images verifiees (demarrage + smoke tests) : \`front\`, \`back\`, \`standalone\`."
+          } >> "$GITHUB_STEP_SUMMARY"

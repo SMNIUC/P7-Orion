@@ -1,0 +1,31 @@
+# =============================================================================
+# Orion MicroCRM - Surcouche "release"
+#
+# Fait tourner les images PUBLIEES sur GHCR au lieu de les reconstruire :
+# c'est exactement l'artefact livre qui est execute, pas une recompilation
+# locale qui pourrait diverger.
+#
+#   export GHCR_OWNER=smniuc IMAGE_TAG=sha-1a2b3c4
+#   docker compose -f docker-compose.yml -f docker-compose.deploy.yml pull
+#   docker compose -f docker-compose.yml -f docker-compose.deploy.yml up -d --no-build --wait
+#
+# Cette surcouche ne redefinit QUE l'origine des images ; ports, healthchecks,
+# reseau et dependances restent ceux de docker-compose.yml (source unique de
+# verite, pas de duplication a maintenir). Le flag --no-build neutralise la
+# section "build:" heritee du fichier de base.
+#
+# Utilisee par le job "deploy" du pipeline (.github/workflows/ci-cd.yml) pour
+# verifier qu'une release demarre reellement avant de promouvoir le tag
+# "latest". Rejouable telle quelle en local pour reproduire une release donnee.
+#
+# Variables requises (aucun secret : les images GHCR publiques suffisent) :
+#   GHCR_OWNER : proprietaire GHCR, en minuscules (ex. "smniuc")
+#   IMAGE_TAG  : tag immuable de la release      (ex. "sha-1a2b3c4")
+# =============================================================================
+
+services:
+  back:
+    image: ghcr.io/${GHCR_OWNER:?GHCR_OWNER est requis (proprietaire GHCR en minuscules)}/microcrm-back:${IMAGE_TAG:?IMAGE_TAG est requis (ex. sha-1a2b3c4)}
+
+  front:
+    image: ghcr.io/${GHCR_OWNER:?GHCR_OWNER est requis (proprietaire GHCR en minuscules)}/microcrm-front:${IMAGE_TAG:?IMAGE_TAG est requis (ex. sha-1a2b3c4)}
