@@ -249,3 +249,47 @@ Pour chaque commande importante : son objectif, où elle est définie, et à que
 ### Mises à jour de dépendances
 
 Les mises à jour (Gradle, npm, Docker, GitHub Actions) sont automatisées via [Dependabot](./.github/dependabot.yml).
+
+## Monitoring local (stack ELK)
+
+Supervision applicative locale avec **Elasticsearch + Logstash + Kibana 8.19.13**, ajoutée en surcouche du compose applicatif. Documentation complète : [`docs/MONITORING-ELK.md`](./docs/MONITORING-ELK.md).
+
+> **Ne fait pas partie du pipeline CI/CD** — trop lourd (~2,3 Go de RAM, ~2 min de démarrage) et sans valeur pour valider un commit. `docker-compose.elk.yml` n'est jamais référencé par le workflow.
+
+### Démarrage
+
+```shell
+# 1. Application + ELK (prévoir ~4 Go alloués à Docker)
+docker compose -f docker-compose.yml -f docker-compose.elk.yml up -d --build
+
+# 2. Créer le tableau de bord (attend que Kibana soit prêt : ~2 min au 1er démarrage)
+./misc/elk/import-dashboard.sh
+
+# 3. Alimenter en trafic réel (dont des erreurs)
+./misc/elk/generate-traffic.sh
+```
+
+- **Kibana** : http://localhost:5601 → *Dashboards* → « MicroCRM — Supervision applicative »
+- **Elasticsearch** : http://localhost:9200
+
+Arrêt : `docker compose -f docker-compose.yml -f docker-compose.elk.yml down` (ajouter `-v` pour supprimer les données indexées **et le tableau de bord** — que `import-dashboard.sh` recrée).
+
+### Ce qui est collecté
+
+Trois sources, toutes en JSON, agrégées dans l'index journalier `microcrm-logs-*` :
+
+| Source | Origine | Apporte |
+|---|---|---|
+| `back` | Logs applicatifs Spring Boot, **JSON ECS natif** (Boot 3.4+, aucune dépendance) | Exceptions, avertissements, stack traces |
+| `back-access` | Access log Tomcat | Statut HTTP et **temps de réponse de l'API** |
+| `front` | Access log Caddy | Requêtes sur les fichiers statiques |
+
+Les trois écrivent dans un volume partagé, lu par Logstash ([`misc/elk/logstash/pipeline/microcrm.conf`](./misc/elk/logstash/pipeline/microcrm.conf)). La configuration de journalisation du back est isolée dans le **profil Spring `elk`** ([`application-elk.properties`](./back/src/main/resources/application-elk.properties)), activé uniquement par la surcouche ELK : un `docker compose up` normal garde des logs console lisibles.
+
+### Tableau de bord
+
+![Tableau de bord Kibana](./misc/screenshots/kibana-dashboard.png)
+
+Sept visualisations : nombre d'erreurs, répartition par niveau, codes HTTP de l'API, volume de logs par source, erreurs dans le temps, temps de réponse (p50/p95/p99) et table des URL en erreur. Il est **versionné** ([`microcrm-dashboard.ndjson`](./misc/elk/kibana/microcrm-dashboard.ndjson)) et donc reproductible après un `down -v`.
+
+`generate-traffic.sh` n'injecte **rien** dans Elasticsearch : il appelle l'application, et les logs suivent la chaîne normale. Les données affichées sont du trafic authentique.
